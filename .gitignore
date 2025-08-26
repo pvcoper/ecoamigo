@@ -1,0 +1,8 @@
+# Ignorar entorno virtual
+.venv/
+
+# Ignorar archivos de logs
+logs/
+
+# Ignorar credenciales locales
+.env

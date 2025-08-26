@@ -1,0 +1,23 @@
+[
+  {
+    "title": "Detergente Eco Concentrado 1L",
+    "url": "https://grinhaus.co/products/detergente-eco-1l",
+    "variant_id": "12345678901234",
+    "price": "$7.990",
+    "tags": ["detergente", "ropa", "biodegradable", "concentrado", "lavado"]
+  },
+  {
+    "title": "Esponja Vegetal de Lufa",
+    "url": "https://grinhaus.co/products/esponja-lufa",
+    "variant_id": "22345678901234",
+    "price": "$2.990",
+    "tags": ["esponja", "lufa", "baño", "cocina", "biodegradable"]
+  },
+  {
+    "title": "Cepillo de Bambú Cerdas Suaves",
+    "url": "https://grinhaus.co/products/cepillo-bambu-suave",
+    "variant_id": "32345678901234",
+    "price": "$3.990",
+    "tags": ["cepillo", "dientes", "bambu", "higiene"]
+  }
+]
