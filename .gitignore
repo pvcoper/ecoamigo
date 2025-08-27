@@ -1,8 +1,13 @@
-# Ignorar entorno virtual
+# Ignorar los siguientews archivos y extensiones en GitHub:
 .venv/
-
-# Ignorar archivos de logs
 logs/
-
-# Ignorar credenciales locales
 .env
+otros_docs/version_v1.6_08.25/theme.liquid_v1.6_08.25.json
+__pycache__/main.cpython-312.pyc
+otros_docs/Checklist_Arranque_EcoAmigo.docx
+otros_docs/Ecomigo_chat_01.txt
+otros_docs/version_v1.6_08.25/.env_v1.6_08.25.json
+otros_docs/version_v1.6_08.25/ecoamigo-snippet_v1.6_08.25.json
+otros_docs/version_v1.6_08.25/main_v1.6_08.25.py
+otros_docs/version_v1.6_08.25/products_v1.6_08.25.json
+otros_docs/version_v1.6_08.25/requirements_v1.6_08.25.txt
