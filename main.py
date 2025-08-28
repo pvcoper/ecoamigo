@@ -101,21 +101,49 @@ def log_chat(session_id: str, user_msg: str, answer: str):
 
 def match_products(user_text: str, topk: int = 3) -> List[Dict[str, Any]]:
     """
-    Búsqueda muy simple por palabras clave sobre title/tags.
+    Búsqueda simple por palabras clave sobre title/tags + filtro de exclusiones por producto.
+    Si 'exclude_keywords' del producto aparece en la consulta, el producto se descarta.
+    - Palabra suelta: usa borde de palabra (\b ... \b)
+    - Frase (tiene espacio): usa coincidencia por subcadena
     """
     if not user_text or not CATALOG:
         return []
     q = user_text.lower()
+    qs = set(q.split())
+
+    def is_excluded(prod: Dict[str, Any]) -> bool:
+        ex = prod.get("exclude_keywords") or []
+        for kw in ex:
+            if not kw:
+                continue
+            kw_norm = str(kw).lower().strip()
+            if not kw_norm:
+                continue
+            # Si es una frase (tiene espacio), usamos subcadena simple
+            if " " in kw_norm:
+                if kw_norm in q:
+                    return True
+            else:
+                # Palabra suelta → borde de palabra
+                if _re.search(rf"\b{_re.escape(kw_norm)}\b", q):
+                    return True
+        return False
+
     scored = []
     for p in CATALOG:
+        # 1) Filtro de exclusión por producto
+        if is_excluded(p):
+            continue
+
+        # 2) Scoring básico por coincidencias en título/tags
         title = (p.get("title") or "").lower()
-        tags = " ".join(p.get("tags", [])).lower() if isinstance(p.get("tags"), list) else str(p.get("tags") or "").lower()
-        score = 0
-        for token in set(q.split()):
-            if token and (token in title or token in tags):
-                score += 1
+        tags  = " ".join(p.get("tags", [])).lower() if isinstance(p.get("tags"), list) else str(p.get("tags") or "").lower()
+        hay   = f"{title} {tags}"
+        score = sum(1 for token in qs if token and token in hay)
+
         if score > 0:
             scored.append((score, p))
+
     scored.sort(key=lambda x: x[0], reverse=True)
     return [p for _, p in scored[:topk]]
 
