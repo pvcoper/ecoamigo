@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from collections import deque, defaultdict  # <-- NUEVO
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +51,7 @@ CATALOG = load_catalog(CATALOG_PATH)
 # =============================
 # App FastAPI + CORS
 # =============================
-app = FastAPI(title="EcoAmigo API", version="1.7")
+app = FastAPI(title="EcoAmigo API", version="1.8")  # bump versión
 
 allowed = os.getenv("ALLOWED_ORIGINS", "")
 origins = [o.strip() for o in allowed.split(",") if o.strip()]
@@ -72,6 +73,13 @@ class ChatPayload(BaseModel):
     query: Optional[str]   = None
     input_text: Optional[str] = None
     session_id: Optional[str] = None
+
+# =============================
+# Memoria en RAM por sesión
+# =============================
+# Guardamos pares user/assistant recientes por session_id
+MAX_TURNS = 6  # últimas 6 interacciones (user+assistant) = 12 mensajes
+MEMORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=2 * MAX_TURNS))
 
 # =============================
 # Utilidades
@@ -148,18 +156,19 @@ def build_client() -> Optional[OpenAI]:
         return None
 
 # =============================
-# Prompt del sistema (con regla nueva)
+# Prompt del sistema (con regla de no-HTML/no-precios en texto)
 # =============================
 SYSTEM_PROMPT = f"""
 Eres EcoAmigo, asistente de {SHOP_NAME}. Tu tono es {SHOP_TONE}.
 - Mantén el contexto de la conversación.
+- Eres experto en sustentabilidad para el hogar
+- Solo responde preguntas relacionadas en el contexto de la sustentasbilidad en el hogar, si te preguntan sobre otro tema debes sutilmente volver a dirigir la conversación al contexto de la sustentabilidad en el hogar.
 - Responde claro y útil. Si corresponde, sugiere productos del catálogo local.
 - No inventes datos; usa solo el catálogo entregado por el backend.
 - Al recomendar, ofrece un bloque HTML con botones "Agregar al carrito" (data-variant-id) y "Ver producto".
 - Si el usuario responde con "sí", "no", "recomiéndame", etc., usa el contexto previo para entender la referencia.
-
-- MUY IMPORTANTE: En el TEXTO LIBRE de tu respuesta NO incluyas precios, enlaces ni bloques HTML de productos.
-  Deja esas acciones solo en las TARJETAS HTML que agrega el backend.
+- MUY IMPORTANTE: En el TEXTO LIBRE de tu respuesta NO incluyas precios, enlaces ni bloques HTML de productos. Deja esas acciones solo en las TARJETAS HTML que agrega el backend.
+- Debes recordar la conversación anterior que se lleva a cabo desde el principio, con tal de ser coherente en tus respuestas.
 """
 
 # =============================
@@ -172,6 +181,7 @@ def root():
         "version": app.version,
         "allowed_origins": origins,
         "catalog_size": len(CATALOG),
+        "memory_sessions": len(MEMORY),  # info útil
     }
 
 @app.get("/health")
@@ -190,51 +200,55 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
     matches = match_products(user_msg, topk=3)
     html_block = render_product_cards(matches) if matches else ""
 
-    # 2) Construir respuesta base (modelo o fallback)
+    # 2) Construir mensajes con MEMORIA por sesión
+    history = MEMORY[session_id]  # deque de dicts {"role": "...", "content": "..."}
+    messages_for_model = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # añadimos historial previo:
+    if history:
+        messages_for_model.extend(list(history))
+    # añadimos mensaje actual:
+    messages_for_model.append({"role": "user", "content": user_msg})
+
+    # 3) Llamar modelo (o fallback)
     client = build_client()
     if client:
-        # ----- OpenAI -----
-        msgs = [
-            {"role": "system",    "content": SYSTEM_PROMPT},
-            {"role": "user",      "content": user_msg},
-        ]
         try:
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=msgs,
+                messages=messages_for_model,
                 temperature=0.4,
             )
             base_answer = (resp.choices[0].message.content or "").strip()
-        except Exception as e:
+        except Exception:
             base_answer = (
                 "Puedo recomendarte alternativas sustentables y, al final, verás botones para agregarlas al carrito o abrir el producto."
             )
     else:
-        # ----- Fallback sin OpenAI -----
         base_answer = (
             "Este es un modo demostración sin conexión a OpenAI. A continuación, verás sugerencias con botones para agregar al carrito o ver producto."
         )
 
-    # 3) Limpieza para evitar duplicados (precio/enlaces/html en el texto libre)
+    # 4) Limpieza para evitar duplicados (precio/enlaces/html en el texto libre)
     if matches and base_answer:
         import re as _re
-        # Quitar bloques de código ``` ... ```
-        base_answer = _re.sub(r"```[\s\S]*?```", "", base_answer)
-        # Quitar líneas "Precio:" / "**Precio**:"
-        base_answer = _re.sub(r"(?im)^\s*\**precio\**\s*:.*$", "", base_answer)
-        # Quitar enlaces markdown hacia URLs del catálogo
+        base_answer = _re.sub(r"```[\s\S]*?```", "", base_answer)                    # quitar ```...```
+        base_answer = _re.sub(r"(?im)^\s*\**precio\**\s*:.*$", "", base_answer)     # quitar líneas "Precio:"
         urls = [p.get("url", "") for p in matches if p.get("url")]
         for u in urls:
             if not u:
                 continue
-            base_answer = _re.sub(rf"\[([^\]]+)\]\({_re.escape(u)}\)", r"\1", base_answer)
-        # Compactar saltos en blanco
+            base_answer = _re.sub(rf"\[([^\]]+)\]\({_re.escape(u)}\)", r"\1", base_answer)  # quitar [texto](url)
         base_answer = _re.sub(r"\n{3,}", "\n\n", base_answer).strip()
 
-    # 4) Respuesta final (texto + tarjetas)
+    # 5) Respuesta final (texto + tarjetas)
     final_answer = base_answer + (f"\n\n{html_block}" if html_block else "")
 
-    # 5) Log
+    # 6) Actualizar MEMORIA (guardamos user y assistant)
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": base_answer})
+    # (el deque tiene maxlen, así que rota solo)
+
+    # 7) Log
     log_chat(session_id, user_msg, final_answer)
 
     return {"answer": final_answer}
