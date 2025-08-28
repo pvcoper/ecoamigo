@@ -151,52 +151,96 @@ def build_client() -> Optional[OpenAI]:
         return client
     except Exception:
         return None
+# =============================
+# Detección de intención de recomendar (versión matizada)
+# =============================
+import re as _re
 
-# =============================
-# Detección de intención de recomendar
-# =============================
-YES_WORDS = {"si", "sí", "dale", "ok", "okey", "de acuerdo", "perfecto", "claro", "bueno", "vale"}
-INTENT_WORDS = {
-    "recomienda", "recomendación", "recomendar", "sugerir", "sugerencia", "sugiere",
-    "busco", "buscando", "necesito", "quiero", "tienen", "tienes", "tiene",
-    "producto", "opciones", "opción", "alternativa", "comprar", "compra",
-    "precio", "cuesta", "vale", "agregar", "añadir", "carrito", "ver producto"
+YES_WORDS = {
+    "si","sí","dale","ok","okey","de acuerdo","perfecto","claro","bueno","vale","ya","hagámoslo","hágamoslo"
 }
 
+# Saludos/pequeños socializadores que NO deben gatillar recomendación
+GREETING_PATTERNS = _re.compile(
+    r"\b(hola|buenas|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches|"
+    r"qué\s+tal|como\s+est[aá]s|soy\s+\w+)\b",
+    flags=_re.IGNORECASE
+)
+
+# Preguntas / pedidos explícitos de recomendación (imperativos y frases comunes)
+EXPLICIT_RECO_PATTERNS = _re.compile(
+    r"("
+    r"recom(i|e)nd(a|ame|ame|ar|aciones?)|"
+    r"¿\s*qu[eé]\s+me\s+recomiendas|"
+    r"puedes\s+recomendar(me)?|"
+    r"me\s+recom(i|e)endas|"
+    r"sug(e|i)r(e|e)?(me)?|suger(e|i)ncia(s)?|"
+    r"puedes\s+sugerir(me)?|me\s+sugieres|"
+    r"opciones?|alternativa(s)?|"
+    r"quiero\s+(ver\s+)?(opciones|productos?)|"
+    r"busco|necesito|"
+    r"alguna\s+recomendaci[oó]n|"
+    r"dame\s+una\s+recomendaci[oó]n|"
+    r"me\s+das\s+un\s+dato|alg[uú]n\s+dato"
+    r")",
+    flags=_re.IGNORECASE
+)
+
+# Palabras de compra/acción que también cuentan como intención
+PURCHASE_INTENT_PATTERNS = _re.compile(
+    r"\b(comprar|compra|precio|cu[eé]sta|vale|agregar|a[nñ]adir|carrito|ver\s+producto|cotizar)\b",
+    flags=_re.IGNORECASE
+)
+
 def normalize(t: str) -> str:
-    return (t or "").lower().strip()
+    return (t or "").strip()
 
 def said_yes(t: str) -> bool:
+    t = " " + normalize(t).lower() + " "
+    return any((" " + w + " ") in t for w in YES_WORDS)
+
+def is_greeting_only(t: str) -> bool:
     t = normalize(t)
-    return any((" " + w + " ") in (" " + t + " ") for w in YES_WORDS) or t in YES_WORDS
+    # Consideramos “solo saludo” si es corto y calza con saludos/presentación
+    return (len(t) <= 25) and bool(GREETING_PATTERNS.search(t))
+
+def has_intent_now(t: str) -> bool:
+    t = normalize(t)
+    if is_greeting_only(t):
+        return False
+    # Intento explícito (recomendar/sugerir/pedir opciones)
+    if EXPLICIT_RECO_PATTERNS.search(t):
+        return True
+    # Señales de compra/acción
+    if PURCHASE_INTENT_PATTERNS.search(t):
+        return True
+    return False
+
+def assistant_offered_recommendation(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return (
+        "¿quieres que te recomiende" in t
+        or "¿te sugiero" in t
+        or "¿quieres que te muestre" in t
+        or "¿quieres recomendaciones" in t
+    )
 
 def should_recommend(user_msg: str, history: deque) -> bool:
-    """
-    Reglas:
-    1) Intención explícita en el mensaje actual (palabras clave).
-    2) Respuesta afirmativa del usuario tras una oferta previa (p.ej. asistente preguntó si quería sugerencias).
-    """
-    u = normalize(user_msg)
-    if any(w in u for w in INTENT_WORDS):
+    # 1) Intención explícita en el mensaje actual
+    if has_intent_now(user_msg):
         return True
 
-    # Si el turno anterior del asistente ofreció recomendar y el usuario dijo "sí"
+    # 2) Confirmación tras oferta previa del asistente
     if history:
-        # Buscar últimos mensajes relevantes
         last_assistant = None
-        last_user = None
-        for m in list(history)[::-1]:
-            if not last_user and m["role"] == "user":
-                last_user = m["content"]
-            elif not last_assistant and m["role"] == "assistant":
+        for m in reversed(history):
+            if m["role"] == "assistant":
                 last_assistant = m["content"]
-            if last_user and last_assistant:
                 break
-        if last_assistant and ("¿quieres que te recomiende" in last_assistant.lower() or
-                               "¿te sugiero" in last_assistant.lower() or
-                               "¿quieres que te muestre" in last_assistant.lower()):
-            if said_yes(u):
-                return True
+        if last_assistant and assistant_offered_recommendation(last_assistant):
+            return said_yes(user_msg)
 
     return False
 
