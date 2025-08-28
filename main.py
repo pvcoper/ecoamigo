@@ -5,15 +5,14 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from collections import deque, defaultdict
+import re as _re
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-import httpx
 from openai import OpenAI
-import re as _re
 
 # =============================
 # Carga de entorno
@@ -52,7 +51,7 @@ CATALOG = load_catalog(CATALOG_PATH)
 # =============================
 # App FastAPI + CORS
 # =============================
-app = FastAPI(title="EcoAmigo API", version="1.9")
+app = FastAPI(title="EcoAmigo API", version="2.0")
 
 allowed = os.getenv("ALLOWED_ORIGINS", "")
 origins = [o.strip() for o in allowed.split(",") if o.strip()]
@@ -151,11 +150,10 @@ def build_client() -> Optional[OpenAI]:
         return client
     except Exception:
         return None
-# =============================
-# Detección de intención de recomendar (versión matizada)
-# =============================
-import re as _re
 
+# =============================
+# Detección de intención de recomendar (matizada para CL)
+# =============================
 YES_WORDS = {
     "si","sí","dale","ok","okey","de acuerdo","perfecto","claro","bueno","vale","ya","hagámoslo","hágamoslo"
 }
@@ -167,22 +165,22 @@ GREETING_PATTERNS = _re.compile(
     flags=_re.IGNORECASE
 )
 
-# Preguntas / pedidos explícitos de recomendación (imperativos y frases comunes)
+# Preguntas / pedidos explícitos de recomendación (imperativos y frases comunes, con variantes locales)
 EXPLICIT_RECO_PATTERNS = _re.compile(
-    r"("
-    r"recom(i|e)nd(a|ame|ame|ar|aciones?)|"
+    r"(recom(i|e)nd(a|ame|ar|aciones?)|"
     r"¿\s*qu[eé]\s+me\s+recomiendas|"
     r"puedes\s+recomendar(me)?|"
     r"me\s+recom(i|e)endas|"
     r"sug(e|i)r(e|e)?(me)?|suger(e|i)ncia(s)?|"
     r"puedes\s+sugerir(me)?|me\s+sugieres|"
     r"opciones?|alternativa(s)?|"
-    r"quiero\s+(ver\s+)?(opciones|productos?)|"
-    r"busco|necesito|"
-    r"alguna\s+recomendaci[oó]n|"
-    r"dame\s+una\s+recomendaci[oó]n|"
-    r"me\s+das\s+un\s+dato|alg[uú]n\s+dato"
-    r")",
+    r"quiero\s+(ver\s+)?(opciones|productos?|comprar)|"
+    r"busco|estoy\s+buscando|ando\s+necesitando|necesito|"
+    r"qué\s+opciones|qué\s+alternativas|qué\s+productos|qué\s+hay\s+para|"
+    r"tienes\s+algo|qué\s+tienen|muestran\s+productos|"
+    r"dame\s+un\s+dato|alg[uú]n\s+dato|datito(s)?|"
+    r"dame\s+un\s+tip|alg[uú]n\s+tip|"
+    r"dame\s+una\s+idea|consejito(s)?)",
     flags=_re.IGNORECASE
 )
 
@@ -201,17 +199,15 @@ def said_yes(t: str) -> bool:
 
 def is_greeting_only(t: str) -> bool:
     t = normalize(t)
-    # Consideramos “solo saludo” si es corto y calza con saludos/presentación
+    # Consideramos “solo saludo/presentación” si es corto y calza con saludos
     return (len(t) <= 25) and bool(GREETING_PATTERNS.search(t))
 
 def has_intent_now(t: str) -> bool:
     t = normalize(t)
     if is_greeting_only(t):
         return False
-    # Intento explícito (recomendar/sugerir/pedir opciones)
     if EXPLICIT_RECO_PATTERNS.search(t):
         return True
-    # Señales de compra/acción
     if PURCHASE_INTENT_PATTERNS.search(t):
         return True
     return False
@@ -254,11 +250,10 @@ Eres EcoAmigo, asistente de {SHOP_NAME}. Tu tono es {SHOP_TONE}.
 - Solo responde preguntas relacionadas con ese contexto; si te preguntan algo fuera, redirige suavemente.
 - Responde claro y útil.
 - MUY IMPORTANTE: Solo recomienda productos si el usuario lo pide explícitamente o si el contexto lo amerita (p. ej., está buscando una solución concreta).
-  Si el usuario solo saluda o da su nombre, responde cordial y pregunta qué necesita antes de sugerir productos.
+  Si el usuario solo saluda o se presenta, responde cordial y pregunta qué necesita antes de sugerir productos.
 - Cuando recomiendes, NO incluyas precios, enlaces ni HTML en el texto libre.
   El backend añadirá al final tarjetas HTML con botones "Agregar al carrito" y "Ver producto".
-- Usa el contexto previo para entender referencias ("sí", "no", "esa", "el primero", etc.).
-- Mantén coherencia y recuerda la conversación previa dentro de esta sesión.
+- Usa el contexto previo para entender referencias ("sí", "no", "esa", "el primero", etc.) y mantén coherencia dentro de la sesión.
 """
 
 # =============================
@@ -329,9 +324,7 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
                 base_answer = _re.sub(rf"\[([^\]]+)\]\({_re.escape(u)}\)", r"\1", base_answer)
         base_answer = _re.sub(r"\n{3,}", "\n\n", base_answer).strip()
 
-    # 6) Respuesta final
-    #    - Si recommend_now: texto + tarjetas
-    #    - Si NO: solo texto (sin tarjetas). El modelo puede ofrecer amablemente sugerir productos si el usuario quiere.
+    # 6) Respuesta final (si recommend_now → texto + tarjetas; si no → solo texto)
     final_answer = base_answer + (f"\n\n{html_block}" if recommend_now and html_block else "")
 
     # 7) Actualizar memoria
@@ -342,7 +335,6 @@ async def chat_endpoint(payload: ChatPayload, request: Request):
     log_chat(session_id, user_msg, final_answer)
 
     return {"answer": final_answer}
-
 
 # =============================
 # Arranque local opcional
