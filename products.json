@@ -5,27 +5,25 @@
     "price": "$6.990",
     "variant_id": "1234567890",
     "tags": ["detergente", "ropa", "lana", "ecológico"],
-    "exclude_keywords": ["perfume", "fragancia", "olor fuerte", "hipoalergénico no"] 
-  }
+    "exclude_keywords": ["perfume", "fragancia", "olor fuerte", "hipoalergénico no"]
+  },
   {
     "title": "Esponja Vegetal de Lufa",
     "url": "https://grinhaus.co/products/esponja-lufa",
     "variant_id": "22345678901234",
     "price": "$2.990",
-    "tags": ["esponja", "lufa", "baño", "cocina", "biodegradable"]
+    "tags": ["esponja", "lufa", "baño", "cocina", "biodegradable"],
     "exclude_keywords": ["dientes", "cepillo"]
-  }
+  },
   {
     "title": "Cepillo de Bambú Cerdas Suaves",
     "url": "https://grinhaus.co/products/cepillo-bambu-suave",
     "variant_id": "32345678901234",
     "price": "$3.990",
-    "tags": ["cepillo de dientes", "dientes", "bambu", "higiene"]
+    "tags": ["cepillo de dientes", "dientes", "bambu", "higiene"],
     "exclude_keywords": ["cocina", "loza", "losa"]
   }
-
-
-
+]
 
 
 
