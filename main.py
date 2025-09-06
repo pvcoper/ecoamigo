@@ -1,8 +1,8 @@
-# main.py — EcoAmigo Chat API (v1.8)
-# Cambios de esta versión:
-# - Recomendaciones SOLAMENTE cuando: (a) el usuario lo solicita, (b) acepta una oferta explícita, o (c) el tema es claramente de productos.
-# - En saludos o temas generales: NO muestra tarjetas; ofrece preguntar si desea recomendaciones y espera confirmación.
-# - Se mantiene matching robusto ES (acentos/sinónimos) y se elimina el fallback automático salvo que exista intención.
+# main.py — EcoAmigo Chat API (v1.8 FINAL)
+# Cambios clave:
+# - Recomendaciones SOLO con intención: solicitud explícita, aceptación de oferta o tema claramente de productos.
+# - En saludos/charla general: NO muestra tarjetas; ofrece preguntar y espera confirmación.
+# - Se evita que el LLM liste productos/links en texto: prompt + sanitización de respuesta.
 # - Carga robusta de catálogo; CORS saneado; endpoints /catalog y /admin/reload.
 
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -139,7 +139,8 @@ Eres EcoAmigo, asistente de {SHOP_NAME}. Tu tono es {SHOP_TONE}.
 - Responde claro y útil.
 - Recomienda productos *solo si* el usuario lo solicita, acepta una oferta explícita o el tema es claramente sobre productos que vendemos.
 - No inventes datos; usa únicamente el catálogo que llega en el contexto.
-- No generes HTML de tarjetas (el backend lo hace). Puedes mencionar productos en texto si ayuda a la explicación.
+- IMPORTANTÍSIMO: cuando recomiendes, NO incluyas nombres de productos, precios ni enlaces en el texto libre.
+- Limita tu respuesta a una frase breve del tipo “Te dejo algunas sugerencias abajo”; el backend agrega las tarjetas.
 """
 
 # ------------------ Matching mejorado ------------------
@@ -268,15 +269,27 @@ def _build_cards_html(matches: List[Dict[str, Any]]) -> str:
             f"{add_btn}"
             f"<a href='{url}' target='_blank' "
             "style='padding:6px 10px; border-radius:8px; background:#e5f3ff; "
-            "color:#0b4a6e; text-decoration:none'>Ver producto</a>"
+            "color:'#0b4a6e'; text-decoration:none'>Ver producto</a>"
             "</div>"
             "</div>"
         )
         cards.append(card)
     return "\n".join(cards)
 
+# ------------------ Sanitizador de respuesta (evitar nombres/links) ------------------
+_URL_RE = re.compile(r'https?://\S+|\b\w+\.\w{2,}\S*', flags=re.IGNORECASE)
+
+def _sanitize_answer_no_links_no_titles(answer: str, products: List[Dict[str, Any]]) -> str:
+    cleaned = _URL_RE.sub("", answer)
+    titles = [str(p.get("title", "")).strip() for p in products if p.get("title")]
+    for t in sorted(titles, key=len, reverse=True):
+        if t:
+            cleaned = re.sub(re.escape(t), "este producto", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s{2,}', " ", cleaned).strip()
+    return cleaned
+
 # ------------------ Heurísticas de intención ------------------
-YES_WORDS = {"si", "sí", "dale", "ok", "claro", "porfa", "por favor", "acepto"}
+YES_WORDS = {"si", "sí", "dale", "ok", "claro", "porfa", "por", "favor", "acepto"}
 REQUEST_WORDS = {"recomienda", "recomendacion", "recomendación", "sugerencia", "sugiere", "quiero", "busco", "necesito", "precio", "comprar", "tienen", "venden"}
 
 
@@ -363,17 +376,13 @@ async def chat(req: ChatRequest, request: Request):
         products_context = ""
 
         if recommend_now:
-            # 1) Buscar productos (y fallback SOLO si hay intención de recomendar)
+            # 1) Buscar productos (fallback SOLO si hay intención)
             matches = find_products(user_text, k=3)
             if not matches and CATALOG:
                 matches = CATALOG[:3]
             if matches:
-                lines = []
-                for p in matches:
-                    lines.append(
-                        f"- {p.get('title')} | precio: {p.get('price','')} | url: {p.get('url','')} | variant_id: {p.get('variant_id','')}"
-                    )
-                products_context = "Productos relevantes:\n" + "\n".join(lines)
+                # Contexto minimalista para no inducir al LLM a listar
+                products_context = f"Hay {len(matches)} productos relevantes para el tema consultado."
 
         # 2) Mensajes para LLM
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -396,16 +405,16 @@ async def chat(req: ChatRequest, request: Request):
                 resp.choices[0].message.content if resp and getattr(resp, "choices", None) else "No pude generar respuesta."
             )
 
-        # 4) Construir tarjetas SOLO si corresponde
+        # 4) Construir tarjetas SOLO si corresponde y sanitizar texto
         html_block = ""
         if recommend_now and matches:
+            base_answer = _sanitize_answer_no_links_no_titles(base_answer, matches)
             html_block = _build_cards_html(matches)
             matched_ids = [str(p.get("variant_id", "")).strip() for p in matches if p.get("variant_id")]
         else:
             # Si no corresponde recomendar, pedir confirmación amable
-            if not recommend_now:
-                flags["awaiting_reco_confirm"] = True
-                base_answer = base_answer + "\n\n¿Quieres que te recomiende algunos productos de la tienda relacionados con lo que necesitas?"
+            flags["awaiting_reco_confirm"] = True
+            base_answer = base_answer + "\n\n¿Quieres que te recomiende algunos productos de la tienda relacionados con lo que necesitas?"
 
         final_answer = base_answer + (f"\n\n{html_block}" if html_block else "")
 
