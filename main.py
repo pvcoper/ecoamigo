@@ -1,11 +1,9 @@
-# main.py — EcoAmigo Chat API (v1.7)
-# Mejoras clave:
-# - Carga robusta de catálogo (corrige catalog_size:0 en Railway/local)
-# - Normalización acento‑insensible y sinónimos básicos ES para mejor matching
-# - Fallback para SIEMPRE mostrar tarjetas (si no hay match, muestra top N)
-# - Prompt ajustado: el LLM NO genera HTML de productos (lo hace el backend)
-# - CORS saneado: agrega https:// a orígenes sin esquema
-# - Endpoints de debug: /catalog y /admin/reload (opcional con ADMIN_TOKEN)
+# main.py — EcoAmigo Chat API (v1.8)
+# Cambios de esta versión:
+# - Recomendaciones SOLAMENTE cuando: (a) el usuario lo solicita, (b) acepta una oferta explícita, o (c) el tema es claramente de productos.
+# - En saludos o temas generales: NO muestra tarjetas; ofrece preguntar si desea recomendaciones y espera confirmación.
+# - Se mantiene matching robusto ES (acentos/sinónimos) y se elimina el fallback automático salvo que exista intención.
+# - Carga robusta de catálogo; CORS saneado; endpoints /catalog y /admin/reload.
 
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +16,7 @@ import os, json, re, csv, datetime, logging, unicodedata
 
 load_dotenv()
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 app = FastAPI(title="EcoAmigo Chat API", version=APP_VERSION)
 
 # ------------------------- CORS -------------------------
@@ -34,12 +32,10 @@ def _sanitize_origin(o: str) -> Optional[str]:
     return f"https://{o}"
 
 ALLOWED_ORIGINS = [o for o in (_sanitize_origin(x) for x in _raw_list) if o]
-# Valores por defecto (útil en dev si .env no define ALLOWED_ORIGINS)
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = [
         "https://grinhaus.co",
         "https://a71669-e2.myshopify.com",
-        "https://TU-NGROK.ngrok-free.app",
         "https://web-production-ea82.up.railway.app",
     ]
 
@@ -79,22 +75,17 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 # ------------------------- Catálogo -------------------------
 BASE_DIR = Path(__file__).resolve().parent
 CATALOG_PATH = os.getenv("CATALOG_PATH", "products.json")
-
-# lista en memoria
 CATALOG: List[Dict[str, Any]] = []
 
 
 def _load_catalog_candidates() -> List[str]:
-    """Posibles rutas para el catálogo (hace robusta la carga en Railway)."""
     candidates = [
         CATALOG_PATH,
         str(BASE_DIR / CATALOG_PATH),
         str(BASE_DIR / "products.json"),
         str(Path.cwd() / CATALOG_PATH),
     ]
-    # quitar duplicados preservando orden
-    seen = set()
-    out = []
+    seen, out = set(), []
     for c in candidates:
         if c not in seen:
             seen.add(c)
@@ -145,11 +136,10 @@ SHOP_TONE = os.getenv(
 
 SYSTEM_PROMPT = f"""
 Eres EcoAmigo, asistente de {SHOP_NAME}. Tu tono es {SHOP_TONE}.
-- Mantén el contexto de la conversación.
-- Responde claro y útil. Si corresponde, sugiere referencias a productos del catálogo local ya proporcionado en el *contexto* del mensaje.
-- No inventes datos; usa sólo la información del catálogo incluida en el contexto.
-- MUY IMPORTANTE: No generes HTML de tarjetas ni botones. El backend añadirá las tarjetas de productos automáticamente.
-- Si el usuario responde con "sí", "no", "recomiéndame", etc., usa el contexto previo para entender la referencia.
+- Responde claro y útil.
+- Recomienda productos *solo si* el usuario lo solicita, acepta una oferta explícita o el tema es claramente sobre productos que vendemos.
+- No inventes datos; usa únicamente el catálogo que llega en el contexto.
+- No generes HTML de tarjetas (el backend lo hace). Puedes mencionar productos en texto si ayuda a la explicación.
 """
 
 # ------------------ Matching mejorado ------------------
@@ -167,7 +157,6 @@ def normalize(s: Optional[str]) -> str:
     return s
 
 
-# Sinónimos y ampliadores simples en ES
 SYNONYMS: Dict[str, List[str]] = {
     "detergente": ["detergente", "lavar", "lavado", "ropa", "manchas", "suavizante"],
     "esponja": ["esponja", "lavaloza", "platos", "cocina", "fibra", "lufa"],
@@ -211,27 +200,30 @@ def find_products(query: str, k: int = 3) -> List[Dict[str, Any]]:
             if w and w in hay["all"]:
                 score += 1
                 if w in hay["title"]:
-                    score += 2  # bonus por aparecer en el título
+                    score += 2
         if score > 0:
             scored.append((score, p))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [p for _, p in scored[:k]]
-
-    # Fallback: si no hay match, devolvemos los primeros k del catálogo para asegurar tarjetas
-    if not top:
-        top = CATALOG[:k]
     return top
 
-# ------------------ Memoria por sesión (RAM) ------------------
+# ------------------ Memoria y flags por sesión ------------------
 SESSIONS: Dict[str, deque] = {}
-MAX_HISTORY = 8  # últimos 8 turnos (user+assistant = 16 mensajes)
+MAX_HISTORY = 8
+SESSION_FLAGS: Dict[str, Dict[str, Any]] = {}
 
 
 def get_history(sid: str) -> deque:
     if sid not in SESSIONS:
         SESSIONS[sid] = deque(maxlen=MAX_HISTORY * 2)
     return SESSIONS[sid]
+
+
+def get_flags(sid: str) -> Dict[str, Any]:
+    if sid not in SESSION_FLAGS:
+        SESSION_FLAGS[sid] = {"awaiting_reco_confirm": False}
+    return SESSION_FLAGS[sid]
 
 # ------------------ Pydantic ------------------
 class ChatRequest(BaseModel):
@@ -283,6 +275,43 @@ def _build_cards_html(matches: List[Dict[str, Any]]) -> str:
         cards.append(card)
     return "\n".join(cards)
 
+# ------------------ Heurísticas de intención ------------------
+YES_WORDS = {"si", "sí", "dale", "ok", "claro", "porfa", "por favor", "acepto"}
+REQUEST_WORDS = {"recomienda", "recomendacion", "recomendación", "sugerencia", "sugiere", "quiero", "busco", "necesito", "precio", "comprar", "tienen", "venden"}
+
+
+def wants_recommendations(user_text: str, history: deque, flags: Dict[str, Any]) -> bool:
+    t = normalize(user_text)
+    words = set(t.split())
+
+    # Si el bot preguntó antes y esperamos confirmación
+    if flags.get("awaiting_reco_confirm"):
+        if words & YES_WORDS:
+            flags["awaiting_reco_confirm"] = False
+            return True
+        if "no" in words:
+            flags["awaiting_reco_confirm"] = False
+            return False
+        return False
+
+    # Solicitud explícita
+    if words & REQUEST_WORDS:
+        return True
+
+    # Tema claramente de productos (coincide con vocabulario del catálogo + sinónimos)
+    vocab = set()
+    for p in CATALOG:
+        vocab |= set(normalize(p.get("title", "")).split())
+        for tag in (p.get("tags", []) or []):
+            vocab |= set(normalize(tag).split())
+    for syns in SYNONYMS.values():
+        vocab |= set(syns)
+
+    if words & vocab:
+        return True
+
+    return False
+
 # ------------------ Rutas ------------------
 @app.get("/")
 def root():
@@ -323,22 +352,30 @@ async def chat(req: ChatRequest, request: Request):
         sid = (req.session_id or "").strip() or "anon"
         ip = request.client.host if request and request.client else ""
 
-        # 1) Productos (para enriquecer contexto + generar tarjetas)
-        matches = find_products(user_text, k=3)
-        matched_ids: List[str] = [str(p.get("variant_id", "")).strip() for p in matches if p.get("variant_id")]
-
-        # Construir contexto de productos para el LLM (sin HTML)
-        products_context = ""
-        if matches:
-            lines = []
-            for p in matches:
-                lines.append(
-                    f"- {p.get('title')} | precio: {p.get('price','')} | url: {p.get('url','')} | variant_id: {p.get('variant_id','')}"
-                )
-            products_context = "Productos relevantes:\n" + "\n".join(lines)
-
-        # 2) Historial + mensaje actual
         history = get_history(sid)
+        flags = get_flags(sid)
+
+        # 0) Detectar intención
+        recommend_now = wants_recommendations(user_text, history, flags)
+
+        matches: List[Dict[str, Any]] = []
+        matched_ids: List[str] = []
+        products_context = ""
+
+        if recommend_now:
+            # 1) Buscar productos (y fallback SOLO si hay intención de recomendar)
+            matches = find_products(user_text, k=3)
+            if not matches and CATALOG:
+                matches = CATALOG[:3]
+            if matches:
+                lines = []
+                for p in matches:
+                    lines.append(
+                        f"- {p.get('title')} | precio: {p.get('price','')} | url: {p.get('url','')} | variant_id: {p.get('variant_id','')}"
+                    )
+                products_context = "Productos relevantes:\n" + "\n".join(lines)
+
+        # 2) Mensajes para LLM
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(list(history))
         user_prompt = user_text + (f"\n\n{products_context}\n\n" if products_context else "")
@@ -359,16 +396,22 @@ async def chat(req: ChatRequest, request: Request):
                 resp.choices[0].message.content if resp and getattr(resp, "choices", None) else "No pude generar respuesta."
             )
 
-        # 4) Tarjetas HTML (siempre mostramos algo: matches o fallback ya forzado arriba)
-        html_block = _build_cards_html(matches)
+        # 4) Construir tarjetas SOLO si corresponde
+        html_block = ""
+        if recommend_now and matches:
+            html_block = _build_cards_html(matches)
+            matched_ids = [str(p.get("variant_id", "")).strip() for p in matches if p.get("variant_id")]
+        else:
+            # Si no corresponde recomendar, pedir confirmación amable
+            if not recommend_now:
+                flags["awaiting_reco_confirm"] = True
+                base_answer = base_answer + "\n\n¿Quieres que te recomiende algunos productos de la tienda relacionados con lo que necesitas?"
 
         final_answer = base_answer + (f"\n\n{html_block}" if html_block else "")
 
-        # 5) Actualizar historial (user + assistant)
+        # 5) Historial y log
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": base_answer})
-
-        # 6) Log
         log_chat(ip, sid, user_text, final_answer, matched_ids)
 
         return {"answer": final_answer, "session_id": sid}
