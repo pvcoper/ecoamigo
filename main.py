@@ -367,9 +367,8 @@ async def chat(req: ChatRequest, request: Request):
 
         history = get_history(sid)
         flags = get_flags(sid)
-
-        # 0) Detectar intención
-        recommend_now = wants_recommendations(user_text, history, flags)
+        flags["turn_count"] += 1
+        recommend_now = wants_recommendations(user_text, history, flags) # 0) Detectar intención
 
         matches: List[Dict[str, Any]] = []
         matched_ids: List[str] = []
