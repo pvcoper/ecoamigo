@@ -209,21 +209,27 @@ def find_products(query: str, k: int = 3) -> List[Dict[str, Any]]:
     top = [p for _, p in scored[:k]]
     return top
 
-# ------------------ Memoria y flags por sesión ------------------
+# ------------------ Memoria por sesión y flags ------------------
 SESSIONS: Dict[str, deque] = {}
 MAX_HISTORY = 8
 SESSION_FLAGS: Dict[str, Dict[str, Any]] = {}
-
 
 def get_history(sid: str) -> deque:
     if sid not in SESSIONS:
         SESSIONS[sid] = deque(maxlen=MAX_HISTORY * 2)
     return SESSIONS[sid]
 
-
 def get_flags(sid: str) -> Dict[str, Any]:
     if sid not in SESSION_FLAGS:
-        SESSION_FLAGS[sid] = {"awaiting_reco_confirm": False}
+        # Inicializa siempre con las dos claves necesarias
+        SESSION_FLAGS[sid] = {
+            "awaiting_reco_confirm": False,
+            "turn_count": 0
+        }
+    else:
+        # Si la sesión existe pero alguna clave falta, se asegura aquí
+        SESSION_FLAGS[sid].setdefault("awaiting_reco_confirm", False)
+        SESSION_FLAGS[sid].setdefault("turn_count", 0)
     return SESSION_FLAGS[sid]
 
 # ------------------ Pydantic ------------------
@@ -365,31 +371,31 @@ async def chat(req: ChatRequest, request: Request):
         sid = (req.session_id or "").strip() or "anon"
         ip = request.client.host if request and request.client else ""
 
+        # Memoria y flags de la sesión
         history = get_history(sid)
         flags = get_flags(sid)
-        flags["turn_count"] += 1
-        recommend_now = wants_recommendations(user_text, history, flags) # 0) Detectar intención
+        flags["turn_count"] = int(flags.get("turn_count", 0)) + 1
 
-        matches: List[Dict[str, Any]] = []
-        matched_ids: List[str] = []
-        products_context = ""
+        # Detectar si corresponde recomendar (solicitud/aceptación/tema de productos)
+        recommend_now = wants_recommendations(user_text, history, flags)
 
+        matches, matched_ids, products_context = [], [], ""
         if recommend_now:
-            # 1) Buscar productos (fallback SOLO si hay intención)
+            # Buscar productos (con fallback SOLO si hay intención de recomendar)
             matches = find_products(user_text, k=3)
             if not matches and CATALOG:
                 matches = CATALOG[:3]
             if matches:
-                # Contexto minimalista para no inducir al LLM a listar
+                # Contexto minimalista para no inducir al LLM a listar productos/links
                 products_context = f"Hay {len(matches)} productos relevantes para el tema consultado."
 
-        # 2) Mensajes para LLM
+        # Mensajes para el LLM
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(list(history))
         user_prompt = user_text + (f"\n\n{products_context}\n\n" if products_context else "")
         messages.append({"role": "user", "content": user_prompt})
 
-        # 3) Llamar a OpenAI (o demo)
+        # Llamado al modelo (o demo)
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not _HAS_OPENAI or not api_key:
             base_answer = f"(Demo sin OpenAI) Recibí: {user_text}"
@@ -401,23 +407,29 @@ async def chat(req: ChatRequest, request: Request):
                 temperature=0.6,
             )
             base_answer = (
-                resp.choices[0].message.content if resp and getattr(resp, "choices", None) else "No pude generar respuesta."
+                resp.choices[0].message.content
+                if resp and getattr(resp, "choices", None)
+                else "No pude generar respuesta."
             )
 
-        # 4) Construir tarjetas SOLO si corresponde y sanitizar texto
+        # Tarjetas SOLO si corresponde recomendar, y sanitizar texto libre
         html_block = ""
         if recommend_now and matches:
-            base_answer = _sanitize_answer_no_links_no_titles(base_answer, matches)
+            base_answer = _sanitize_answer(base_answer, matches)  # elimina URLs y títulos en texto
             html_block = _build_cards_html(matches)
             matched_ids = [str(p.get("variant_id", "")).strip() for p in matches if p.get("variant_id")]
         else:
-            # Si no corresponde recomendar, pedir confirmación amable
-            flags["awaiting_reco_confirm"] = True
-            base_answer = base_answer + "\n\n¿Quieres que te recomiende algunos productos de la tienda relacionados con lo que necesitas?"
+            # Preguntar si quiere recomendaciones, pero solo desde el segundo turno
+            if not recommend_now and int(flags.get("turn_count", 1)) > 1:
+                flags["awaiting_reco_confirm"] = True
+                base_answer = (
+                    base_answer
+                    + "\n\n¿Quieres que te recomiende algunos productos de la tienda relacionados con lo que necesitas?"
+                )
 
         final_answer = base_answer + (f"\n\n{html_block}" if html_block else "")
 
-        # 5) Historial y log
+        # Actualizar historial y log
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": base_answer})
         log_chat(ip, sid, user_text, final_answer, matched_ids)
@@ -429,3 +441,4 @@ async def chat(req: ChatRequest, request: Request):
         if "quota" in msg.lower() or "429" in msg:
             return {"answer": "⚠️ Sin crédito suficiente en OpenAI ahora mismo. (Respuesta de prueba) 🌱"}
         raise HTTPException(status_code=500, detail=f"Error interno: {msg}")
+    
